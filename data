@@ -8,6 +8,7 @@ import warnings
 warnings.filterwarnings('ignore')
 print ("Libraries imported.")
 
+
 ASSET_UNIVERSE = {
     # Equities
     'ES': 'SPY',    # S&P 500
@@ -34,3 +35,31 @@ print(f"Asset universe defined: {len(ASSET_UNIVERSE)} assets")
 print("\nAssets:")
 for futures_name, etf_ticker in ASSET_UNIVERSE.items():
     print(f"  {futures_name:5} to {etf_ticker:5}")
+
+
+# Here set time range for our data
+END_DATE = datetime.now()
+START_DATE = END_DATE - timedelta(days=365*10)  # ExL: 10 yrs ago
+
+print(f"\n Downloading data from {START_DATE.date()} to {END_DATE.date()}")
+
+# Download data for all assets
+data = {}  # Dictionary to store dataframes
+
+for futures_name, etf_ticker in ASSET_UNIVERSE.items():
+    print(f"Downloading {futures_name} ({etf_ticker})...", end=" ")
+    
+    try:
+        # Downloading from Yahoo Finance, may be able to find other data for future backtesting later
+        df = yf.download(etf_ticker, start=START_DATE, end=END_DATE, progress=False)
+        
+        # Extract specifically closing price
+        data[futures_name] = df['Close']
+        
+        print(f" {len(df)} days of data")
+        
+    except Exception as e:
+        print(f" Error: {e}")
+        data[futures_name] = None
+
+print("\n Download complete!")
