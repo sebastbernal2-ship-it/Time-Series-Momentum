@@ -7,3 +7,30 @@ import warnings
   
 warnings.filterwarnings('ignore')
 print ("Libraries imported.")
+
+ASSET_UNIVERSE = {
+    # Equities
+    'ES': 'SPY',    # S&P 500
+    'NQ': 'QQQ',    # Nasdaq 100
+    'RTY': 'IWM',   # Russell 2000
+    
+    # Commodities
+    'CL': 'USO',    # Crude Oil
+    'GC': 'GLD',    # Gold
+    'HG': 'CPER',   # Copper
+    'NG': 'UNG',    # Natural Gas
+    
+    # FX
+    'EUR': 'FXE',   # EUR/USD
+    'GBP': 'FXB',   # GBP/USD
+    'JPY': 'FXY',   # JPY/USD
+    
+    # Fixed Income
+    'ZN': 'IEF',    # 10Y Treasury Bond
+    'ZB': 'TLT',    # 20Y Treasury Bond
+}
+
+print(f"Asset universe defined: {len(ASSET_UNIVERSE)} assets")
+print("\nAssets:")
+for futures_name, etf_ticker in ASSET_UNIVERSE.items():
+    print(f"  {futures_name:5} to {etf_ticker:5}")
