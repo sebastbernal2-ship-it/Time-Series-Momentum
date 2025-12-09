@@ -63,3 +63,17 @@ for futures_name, etf_ticker in ASSET_UNIVERSE.items():
         data[futures_name] = None
 
 print("\n Download complete!")
+
+
+# Combine all assets into singular dataframe
+# Each column = 1 asset, each row = 1 date
+price_data = pd.DataFrame(data)
+
+print(f"\n Combined data shape: {price_data.shape}")
+print(f"   ({price_data.shape[0]} days × {price_data.shape[1]} assets)")
+
+# Check for missing data
+missing_pct = (price_data.isnull().sum() / len(price_data)) * 100
+print("\n Missing data by asset:")
+for asset, pct in missing_pct.items():
+    print(f"   {asset:5}: {pct:.2f}%")
