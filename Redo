@@ -60,8 +60,13 @@ print(f"\nPrice data shape: {price_data.shape}")
 if price_data.shape[1] > 0:
     print("\nFirst few rows:")
     print(price_data.head())
-    
-    # TSMOM backtest
+
+print(price_data.head())
+
+# ========================================
+# PRODUCTION TSMOM BACKTEST
+# ========================================
+if price_data.shape[1] > 0:
     lookback = 252
     returns = price_data.pct_change(lookback)
     signal = pd.DataFrame(np.where(returns > 0, 1, np.where(returns < 0, -1, 0)), 
@@ -70,27 +75,66 @@ if price_data.shape[1] > 0:
     daily_returns = price_data.pct_change()
     strategy_returns = signal.shift(1) * daily_returns
     portfolio_returns = strategy_returns.mean(axis=1)
-    cumulative_returns = (1 + portfolio_returns).cumprod()
+    cum_basic = (1 + portfolio_returns).cumprod()
     
-
-total_return = cumulative_returns.iloc[-1] - 1
-annual_return = (cumulative_returns.iloc[-1]) ** (252/len(cumulative_returns)) - 1
-volatility = portfolio_returns.std() * np.sqrt(252)
-sharpe = annual_return / volatility
-max_dd = ((cumulative_returns / cumulative_returns.cummax()) - 1).min()
-
-print(f"\nTSMOM RESULTS:")
-print(f"Annual Return:  {annual_return:.1%}")
-print(f"Volatility:     {volatility:.1%}")
-print(f"Sharpe Ratio:   {sharpe:.2f}")
-print(f"Max Drawdown:   {max_dd:.1%}")
-
-       
+    # 1. TRANSACTION COSTS (0.02% per side)
+    costs = 0.0002 * np.abs(signal.diff())
+    net_returns = strategy_returns - costs
+    net_portfolio = net_returns.mean(axis=1)
+    cum_net = (1 + net_portfolio).cumprod()
+    
+    # 2. VOLATILITY TARGETING (40% target)
+    vol_target = 0.40
+    rolling_vol = daily_returns.rolling(60).std() * np.sqrt(252)
+    vol_multiplier = vol_target / (rolling_vol.mean(axis=1) + 0.01)  # +0.01 avoid div0
+    vol_target_returns = (vol_multiplier * signal.shift(1) * daily_returns).sum(axis=1)
+    cum_vol = (1 + vol_target_returns).cumprod()
+    
+    # 3. RISK PARITY WEIGHTS
+    asset_vol = daily_returns.rolling(60).std()
+    risk_weights = 1 / (asset_vol + 0.01)  # Avoid div0
+    risk_weights = risk_weights.div(risk_weights.sum(axis=1), axis=0)
+    rp_returns = (risk_weights * signal.shift(1) * daily_returns).sum(axis=1)
+    cum_rp = (1 + rp_returns).cumprod()
+    
+    # FULL METRICS
+    def calc_metrics(returns):
+        cum = (1 + returns).cumprod()
+        ann_ret = cum.iloc[-1] ** (252/len(cum)) - 1
+        vol = returns.std() * np.sqrt(252)
+        vol = vol if vol > 0 else 0.01
+        sharpe = ann_ret / vol if vol > 0 else 0.0
+        max_dd = (cum / cum.cummax() - 1).min()
+        return ann_ret, sharpe, max_dd
+    
+    basic_ret, basic_sharpe, basic_dd = calc_metrics(portfolio_returns)
+    net_ret, net_sharpe, net_dd = calc_metrics(net_portfolio)
+    vol_ret, vol_sharpe, vol_dd = calc_metrics(vol_target_returns)
+    rp_ret, rp_sharpe, rp_dd = calc_metrics(rp_returns)
+    
+    print("\n" + "="*70)
+    print("TSMOM PRODUCTION RESULTS (2016-2025)")
+    print("="*70)
+    print(f"{'Strategy':<15} {'Ann Ret':<8} {'Sharpe':<8} {'Max DD':<8} {'Turnover'}")
+    print("-"*70)
+    print(f"{'Basic EW':<15} {basic_ret:.1%} {basic_sharpe:.2f} {basic_dd:.1%} {'-' :>8}")
+    print(f"{'+ Costs':<15} {net_ret:.1%} {net_sharpe:.2f} {net_dd:.1%} {costs.sum(axis=1).mean()*252:.0f}")
+    print(f"{'+ Vol Target':<15} {vol_ret:.1%} {vol_sharpe:.2f} {vol_dd:.1%} {'-' :>8}")
+    print(f"{'Risk Parity':<15} {rp_ret:.1%} {rp_sharpe:.2f} {rp_dd:.1%} {'-' :>8}")
+print("="*70)
+    
+    # PLOT
 try:
     import matplotlib.pyplot as plt
-    cumulative_returns.plot(title="TSMOM Portfolio (12 Assets)")
+    plt.figure(figsize=(12, 8))
+    plt.plot(cum_basic.index, cum_basic, label='Basic EW', alpha=0.7)
+    plt.plot(cum_net.index, cum_net, label='+ Costs', linewidth=2)
+    plt.plot(cum_vol.index, cum_vol, label='+ Vol Target', linewidth=2)
+    plt.plot(cum_rp.index, cum_rp, label='Risk Parity', linewidth=2)
+    plt.title('TSMOM Production Versions', fontsize=14)
+    plt.ylabel('Cumulative Return')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.show()
 except:
     print("pip install matplotlib")
-else:
-    print("No data")
