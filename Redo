@@ -1,0 +1,96 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# Asset universe: futures mapped to ETFs
+futures_to_etf = {
+    'ES': 'SPY', 'NQ': 'QQQ', 'RTY': 'IWM', 'CL': 'USO', 
+    'GC': 'GLD', 'HG': 'CPER', 'NG': 'UNG', 'EUR': 'FXE', 
+    'GBP': 'FXB', 'JPY': 'FXY', 'ZN': 'IEF', 'ZB': 'TLT'
+}
+
+start = '2015-12-31'
+end = '2025-12-28'
+
+print("Libraries imported.")
+print("Asset universe defined: 12 assets")
+print("\nAssets:")
+for future, etf in futures_to_etf.items():
+    print(f"  {future:4s} to {etf}")
+
+print(f"\nDownloading data from {start} to {end}")
+
+data = {}
+for future, etf in futures_to_etf.items():
+    print(f"Downloading {future} ({etf})...", end=" ")
+    try:
+        df = yf.download(etf, start=start, end=end, progress=False, auto_adjust=True)
+        
+        if not df.empty:
+            # BULLETPROOF FIX: Handle MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                close_col = df['Close'].iloc[:, 0] if 'Close' in df.columns.get_level_values(0) else df.iloc[:, -2]  # Last price col
+            else:
+                close_col = df['Close']
+            
+            prices = close_col.dropna()
+            if len(prices) > 0:
+                data[future] = prices
+                print(f"{len(prices)} days")
+                continue
+        
+        print("failed")
+        data[future] = pd.Series(dtype=float)
+    except Exception as e:
+        print(f"error: {e}")
+        data[future] = pd.Series(dtype=float)
+
+print("\nDownload complete!")
+
+# DEBUG
+print("\nDEBUG - Data structure check:")
+for k, v in data.items():
+    print(f"{k}: type={type(v).__name__}, shape={getattr(v, 'shape', 'N/A')}")
+
+# Create DataFrame
+price_data = pd.DataFrame(data).ffill().dropna(how='all')
+
+print(f"\nPrice data shape: {price_data.shape}")
+if price_data.shape[1] > 0:
+    print("\nFirst few rows:")
+    print(price_data.head())
+    
+    # TSMOM backtest
+    lookback = 252
+    returns = price_data.pct_change(lookback)
+    signal = pd.DataFrame(np.where(returns > 0, 1, np.where(returns < 0, -1, 0)), 
+                         index=returns.index, columns=returns.columns)
+    
+    daily_returns = price_data.pct_change()
+    strategy_returns = signal.shift(1) * daily_returns
+    portfolio_returns = strategy_returns.mean(axis=1)
+    cumulative_returns = (1 + portfolio_returns).cumprod()
+    
+
+total_return = cumulative_returns.iloc[-1] - 1
+annual_return = (cumulative_returns.iloc[-1]) ** (252/len(cumulative_returns)) - 1
+volatility = portfolio_returns.std() * np.sqrt(252)
+sharpe = annual_return / volatility
+max_dd = ((cumulative_returns / cumulative_returns.cummax()) - 1).min()
+
+print(f"\nTSMOM RESULTS:")
+print(f"Annual Return:  {annual_return:.1%}")
+print(f"Volatility:     {volatility:.1%}")
+print(f"Sharpe Ratio:   {sharpe:.2f}")
+print(f"Max Drawdown:   {max_dd:.1%}")
+
+       
+try:
+    import matplotlib.pyplot as plt
+    cumulative_returns.plot(title="TSMOM Portfolio (12 Assets)")
+    plt.show()
+except:
+    print("pip install matplotlib")
+else:
+    print("No data")

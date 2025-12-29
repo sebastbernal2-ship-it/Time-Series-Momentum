@@ -65,6 +65,12 @@ for futures_name, etf_ticker in ASSET_UNIVERSE.items():
 print("\n Download complete!")
 
 
+for key in data:
+    if not isinstance(data[key], (list, np.ndarray, pd.Series)):
+        data[key] = [data[key]]
+        
+price_data = pd.DataFrame(data)
+
 # Combine all assets into singular dataframe
 # Each column = 1 asset, each row = 1 date
 price_data = pd.DataFrame(data)
@@ -99,3 +105,23 @@ price_data_clean.to_csv(clean_data_file)
 
 print(f"\n Data saved to: {clean_data_file}")
 print(f"   To reload later: df = pd.read_csv('{clean_data_file}', index_col=0, parse_dates=True)")
+
+
+
+
+# Plot all assets (normalized to 100 at start)
+normalized_prices = (price_data_clean / price_data_clean.iloc[0]) * 100
+
+plt.figure(figsize=(14, 7))
+for col in normalized_prices.columns:
+    plt.plot(normalized_prices.index, normalized_prices[col], label=col, alpha=0.7)
+
+plt.title('Asset Price Performance (Normalized to 100)', fontsize=16)
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Index (Start = 100)', fontsize=12)
+plt.legend(loc='upper left', fontsize=8)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("\ Data loading complete! Ready for next step.")
