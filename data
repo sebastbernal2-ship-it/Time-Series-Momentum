@@ -91,3 +91,11 @@ print(f"   Removed {price_data.shape[0] - price_data_clean.shape[0]} incomplete 
 # Display first few rows
 print("\n📋 First 5 rows:")
 print(price_data_clean.head())
+
+
+# Save cleaned data to CSV for future use, avoids redownloading same data
+clean_data_file = 'futures_price_data.csv'
+price_data_clean.to_csv(clean_data_file)
+
+print(f"\n Data saved to: {clean_data_file}")
+print(f"   To reload later: df = pd.read_csv('{clean_data_file}', index_col=0, parse_dates=True)")
