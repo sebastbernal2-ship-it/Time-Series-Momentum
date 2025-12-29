@@ -21,6 +21,7 @@ for future, etf in futures_to_etf.items():
 
 print(f"\nDownloading data from {start} to {end}")
 
+# Download data
 data = {}
 for future, etf in futures_to_etf.items():
     print(f"Downloading {future} ({etf})...", end=" ")
@@ -28,9 +29,9 @@ for future, etf in futures_to_etf.items():
         df = yf.download(etf, start=start, end=end, progress=False, auto_adjust=True)
         
         if not df.empty:
-            # BULLETPROOF FIX: Handle MultiIndex columns
+            # Handle MultiIndex columns
             if isinstance(df.columns, pd.MultiIndex):
-                close_col = df['Close'].iloc[:, 0] if 'Close' in df.columns.get_level_values(0) else df.iloc[:, -2]  # Last price col
+                close_col = df['Close'].iloc[:, 0] if 'Close' in df.columns.get_level_values(0) else df.iloc[:, -2]
             else:
                 close_col = df['Close']
             
@@ -48,11 +49,6 @@ for future, etf in futures_to_etf.items():
 
 print("\nDownload complete!")
 
-# DEBUG
-print("\nDEBUG - Data structure check:")
-for k, v in data.items():
-    print(f"{k}: type={type(v).__name__}, shape={getattr(v, 'shape', 'N/A')}")
-
 # Create DataFrame
 price_data = pd.DataFrame(data).ffill().dropna(how='all')
 
@@ -61,50 +57,125 @@ if price_data.shape[1] > 0:
     print("\nFirst few rows:")
     print(price_data.head())
 
-print(price_data.head())
-
 # ========================================
-# PRODUCTION TSMOM BACKTEST
+# PRODUCTION TSMOM BACKTEST (FIXED)
 # ========================================
 if price_data.shape[1] > 0:
-    lookback = 252
-    returns = price_data.pct_change(lookback)
-    signal = pd.DataFrame(np.where(returns > 0, 1, np.where(returns < 0, -1, 0)), 
-                         index=returns.index, columns=returns.columns)
     
+    # Calculate daily returns
     daily_returns = price_data.pct_change()
+    
+    # MOMENTUM SIGNAL (12-month lookback, 1-month skip)
+    lookback = 252  # 12 months
+    skip = 21       # Skip last month to avoid reversal
+    
+    # Calculate momentum: return from t-252 to t-21
+    momentum = (price_data.shift(skip) / price_data.shift(lookback + skip)) - 1
+    
+    # Generate signals: +1 for positive momentum, -1 for negative
+    signal = pd.DataFrame(
+        np.where(momentum > 0, 1, np.where(momentum < 0, -1, 0)), 
+        index=momentum.index, 
+        columns=momentum.columns
+    )
+    
+    # Remove warm-up period (first lookback + skip days)
+    warmup = lookback + skip
+    signal.iloc[:warmup] = 0
+    daily_returns = daily_returns.iloc[warmup:]
+    signal = signal.iloc[warmup:]
+    price_data_trim = price_data.iloc[warmup:]
+    
+    # ========================================
+    # 1. BASIC EQUAL-WEIGHTED TSMOM
+    # ========================================
+    
+    # Apply signals to returns (signal from yesterday applied to today's return)
     strategy_returns = signal.shift(1) * daily_returns
+    
+    # Equal-weight portfolio
     portfolio_returns = strategy_returns.mean(axis=1)
     cum_basic = (1 + portfolio_returns).cumprod()
     
-    # 1. TRANSACTION COSTS (0.02% per side)
-    costs = 0.0002 * np.abs(signal.diff())
-    net_returns = strategy_returns - costs
+    # ========================================
+    # 2. WITH TRANSACTION COSTS
+    # ========================================
+    
+    # Calculate turnover (signal changes)
+    position_changes = signal.diff().abs()
+    
+    # Transaction cost: 0.02% per trade (one-way)
+    cost_per_trade = 0.0002
+    costs_per_asset = position_changes * cost_per_trade
+    
+    # Net returns after costs (divided equally across assets)
+    net_returns = strategy_returns - costs_per_asset
     net_portfolio = net_returns.mean(axis=1)
     cum_net = (1 + net_portfolio).cumprod()
     
-    # 2. VOLATILITY TARGETING (40% target)
-    vol_target = 0.40
-    rolling_vol = daily_returns.rolling(60).std() * np.sqrt(252)
-    vol_multiplier = vol_target / (rolling_vol.mean(axis=1) + 0.01)  # +0.01 avoid div0
-    vol_target_returns = (vol_multiplier * signal.shift(1) * daily_returns).sum(axis=1)
+    # Calculate annual turnover
+    annual_turnover = position_changes.sum(axis=1).sum() / len(position_changes) * 252
+    
+    # ========================================
+    # 3. VOLATILITY TARGETING (10% target)
+    # ========================================
+    
+    vol_target = 0.10  # 10% annualized target
+    vol_window = 60    # 3-month rolling window
+    
+    # Calculate realized portfolio volatility
+    portfolio_vol = portfolio_returns.rolling(vol_window).std() * np.sqrt(252)
+    
+    # Scale positions to hit target volatility
+    vol_scalar = vol_target / portfolio_vol.replace(0, np.nan)
+    vol_scalar = vol_scalar.clip(0, 3)  # Cap at 3x leverage
+    vol_scalar = vol_scalar.fillna(1)
+    
+    # Apply volatility scaling
+    vol_target_returns = portfolio_returns * vol_scalar.shift(1)
     cum_vol = (1 + vol_target_returns).cumprod()
     
-    # 3. RISK PARITY WEIGHTS
-    asset_vol = daily_returns.rolling(60).std()
-    risk_weights = 1 / (asset_vol + 0.01)  # Avoid div0
-    risk_weights = risk_weights.div(risk_weights.sum(axis=1), axis=0)
-    rp_returns = (risk_weights * signal.shift(1) * daily_returns).sum(axis=1)
+    # ========================================
+    # 4. RISK PARITY WEIGHTING
+    # ========================================
+    
+    # Calculate rolling volatility for each asset
+    asset_vol = daily_returns.rolling(vol_window).std() * np.sqrt(252)
+    asset_vol = asset_vol.replace(0, np.nan).fillna(method='ffill').fillna(0.01)
+    
+    # Risk parity weights: inversely proportional to volatility
+    inverse_vol = 1 / asset_vol
+    risk_weights = inverse_vol.div(inverse_vol.sum(axis=1), axis=0)
+    
+    # Apply risk parity weights to strategy returns
+    rp_returns = (risk_weights.shift(1) * signal.shift(1) * daily_returns).sum(axis=1)
     cum_rp = (1 + rp_returns).cumprod()
     
-    # FULL METRICS
+    # ========================================
+    # CALCULATE PERFORMANCE METRICS
+    # ========================================
+    
     def calc_metrics(returns):
+        """Calculate annualized return, Sharpe ratio, and max drawdown"""
+        returns = returns.dropna()
+        if len(returns) == 0:
+            return 0.0, 0.0, 0.0
+        
         cum = (1 + returns).cumprod()
-        ann_ret = cum.iloc[-1] ** (252/len(cum)) - 1
+        
+        # Annualized return
+        total_years = len(returns) / 252
+        ann_ret = (cum.iloc[-1] ** (1 / total_years)) - 1 if total_years > 0 else 0
+        
+        # Sharpe ratio (assuming 0% risk-free rate)
         vol = returns.std() * np.sqrt(252)
-        vol = vol if vol > 0 else 0.01
         sharpe = ann_ret / vol if vol > 0 else 0.0
-        max_dd = (cum / cum.cummax() - 1).min()
+        
+        # Maximum drawdown
+        running_max = cum.cummax()
+        drawdown = (cum - running_max) / running_max
+        max_dd = drawdown.min()
+        
         return ann_ret, sharpe, max_dd
     
     basic_ret, basic_sharpe, basic_dd = calc_metrics(portfolio_returns)
@@ -112,29 +183,103 @@ if price_data.shape[1] > 0:
     vol_ret, vol_sharpe, vol_dd = calc_metrics(vol_target_returns)
     rp_ret, rp_sharpe, rp_dd = calc_metrics(rp_returns)
     
+    # ========================================
+    # DISPLAY RESULTS
+    # ========================================
+    
     print("\n" + "="*70)
     print("TSMOM PRODUCTION RESULTS (2016-2025)")
     print("="*70)
-    print(f"{'Strategy':<15} {'Ann Ret':<8} {'Sharpe':<8} {'Max DD':<8} {'Turnover'}")
+    print(f"{'Strategy':<20} {'Ann Ret':>8} {'Sharpe':>8} {'Max DD':>8} {'Turnover':>10}")
     print("-"*70)
-    print(f"{'Basic EW':<15} {basic_ret:.1%} {basic_sharpe:.2f} {basic_dd:.1%} {'-' :>8}")
-    print(f"{'+ Costs':<15} {net_ret:.1%} {net_sharpe:.2f} {net_dd:.1%} {costs.sum(axis=1).mean()*252:.0f}")
-    print(f"{'+ Vol Target':<15} {vol_ret:.1%} {vol_sharpe:.2f} {vol_dd:.1%} {'-' :>8}")
-    print(f"{'Risk Parity':<15} {rp_ret:.1%} {rp_sharpe:.2f} {rp_dd:.1%} {'-' :>8}")
-print("="*70)
+    print(f"{'Basic EW':<20} {basic_ret:>7.1%} {basic_sharpe:>8.2f} {basic_dd:>8.1%} {'-':>10}")
+    print(f"{'+ Costs (2bp)':<20} {net_ret:>7.1%} {net_sharpe:>8.2f} {net_dd:>8.1%} {annual_turnover:>9.1f}x")
+    print(f"{'+ Vol Target (10%)':<20} {vol_ret:>7.1%} {vol_sharpe:>8.2f} {vol_dd:>8.1%} {'-':>10}")
+    print(f"{'Risk Parity':<20} {rp_ret:>7.1%} {rp_sharpe:>8.2f} {rp_dd:>8.1%} {'-':>10}")
+    print("="*70)
     
-    # PLOT
-try:
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(12, 8))
-    plt.plot(cum_basic.index, cum_basic, label='Basic EW', alpha=0.7)
-    plt.plot(cum_net.index, cum_net, label='+ Costs', linewidth=2)
-    plt.plot(cum_vol.index, cum_vol, label='+ Vol Target', linewidth=2)
-    plt.plot(cum_rp.index, cum_rp, label='Risk Parity', linewidth=2)
-    plt.title('TSMOM Production Versions', fontsize=14)
-    plt.ylabel('Cumulative Return')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-except:
-    print("pip install matplotlib")
+    # Additional statistics
+    print("\nAdditional Statistics:")
+    print(f"  Backtest period: {signal.index[0].strftime('%Y-%m-%d')} to {signal.index[-1].strftime('%Y-%m-%d')}")
+    print(f"  Trading days: {len(signal)}")
+    print(f"  Average positions per day: {signal.abs().sum(axis=1).mean():.1f} / {len(futures_to_etf)}")
+    print(f"  Win rate (Basic): {(portfolio_returns > 0).sum() / len(portfolio_returns):.1%}")
+    print(f"  Annual turnover: {annual_turnover:.1f}x")
+    
+    # ========================================
+    # PLOTTING
+    # ========================================
+    
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # 1. Cumulative returns
+        ax1 = axes[0, 0]
+        ax1.plot(cum_basic.index, cum_basic, label='Basic EW', linewidth=2)
+        ax1.plot(cum_net.index, cum_net, label='+ Costs', linewidth=2)
+        ax1.plot(cum_vol.index, cum_vol, label='+ Vol Target', linewidth=2)
+        ax1.plot(cum_rp.index, cum_rp, label='Risk Parity', linewidth=2)
+        ax1.set_title('Cumulative Returns', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Cumulative Return')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Drawdowns
+        ax2 = axes[0, 1]
+        dd_basic = (cum_basic / cum_basic.cummax() - 1) * 100
+        dd_net = (cum_net / cum_net.cummax() - 1) * 100
+        dd_vol = (cum_vol / cum_vol.cummax() - 1) * 100
+        dd_rp = (cum_rp / cum_rp.cummax() - 1) * 100
+        
+        ax2.fill_between(dd_basic.index, dd_basic, 0, alpha=0.3, label='Basic EW')
+        ax2.fill_between(dd_net.index, dd_net, 0, alpha=0.3, label='+ Costs')
+        ax2.fill_between(dd_vol.index, dd_vol, 0, alpha=0.3, label='+ Vol Target')
+        ax2.fill_between(dd_rp.index, dd_rp, 0, alpha=0.3, label='Risk Parity')
+        ax2.set_title('Drawdowns', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Drawdown (%)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Rolling Sharpe (1-year)
+        ax3 = axes[1, 0]
+        roll_window = 252
+        roll_sharpe_basic = (portfolio_returns.rolling(roll_window).mean() * 252) / (portfolio_returns.rolling(roll_window).std() * np.sqrt(252))
+        roll_sharpe_net = (net_portfolio.rolling(roll_window).mean() * 252) / (net_portfolio.rolling(roll_window).std() * np.sqrt(252))
+        
+        ax3.plot(roll_sharpe_basic.index, roll_sharpe_basic, label='Basic EW', linewidth=2)
+        ax3.plot(roll_sharpe_net.index, roll_sharpe_net, label='+ Costs', linewidth=2)
+        ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax3.set_title('Rolling 1-Year Sharpe Ratio', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('Sharpe Ratio')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. Annual returns
+        ax4 = axes[1, 1]
+        annual_basic = portfolio_returns.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
+        annual_net = net_portfolio.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
+        
+        years = [d.year for d in annual_basic.index]
+        x = np.arange(len(years))
+        width = 0.35
+        
+        ax4.bar(x - width/2, annual_basic, width, label='Basic EW', alpha=0.8)
+        ax4.bar(x + width/2, annual_net, width, label='+ Costs', alpha=0.8)
+        ax4.set_title('Annual Returns', fontsize=12, fontweight='bold')
+        ax4.set_ylabel('Return (%)')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(years, rotation=45)
+        ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('tsmom_results.png', dpi=300, bbox_inches='tight')
+        print("\nChart saved to: tsmom_results.png")
+        plt.show()
+        
+    except Exception as e:
+        print(f"\nPlotting error: {e}")
+        print("Install matplotlib: pip install matplotlib")
