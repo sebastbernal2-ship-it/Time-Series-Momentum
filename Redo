@@ -2,6 +2,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
 # Asset universe: futures mapped to ETFs
 futures_to_etf = {
@@ -29,7 +31,6 @@ for future, etf in futures_to_etf.items():
         df = yf.download(etf, start=start, end=end, progress=False, auto_adjust=True)
         
         if not df.empty:
-            # Handle MultiIndex columns
             if isinstance(df.columns, pd.MultiIndex):
                 close_col = df['Close'].iloc[:, 0] if 'Close' in df.columns.get_level_values(0) else df.iloc[:, -2]
             else:
@@ -58,7 +59,7 @@ if price_data.shape[1] > 0:
     print(price_data.head())
 
 # ========================================
-# PRODUCTION TSMOM BACKTEST (FIXED)
+# PRODUCTION TSMOM BACKTEST
 # ========================================
 if price_data.shape[1] > 0:
     
@@ -66,8 +67,8 @@ if price_data.shape[1] > 0:
     daily_returns = price_data.pct_change()
     
     # MOMENTUM SIGNAL (12-month lookback, 1-month skip)
-    lookback = 252  # 12 months
-    skip = 21       # Skip last month to avoid reversal
+    lookback = 252
+    skip = 21
     
     # Calculate momentum: return from t-252 to t-21
     momentum = (price_data.shift(skip) / price_data.shift(lookback + skip)) - 1
@@ -79,7 +80,7 @@ if price_data.shape[1] > 0:
         columns=momentum.columns
     )
     
-    # Remove warm-up period (first lookback + skip days)
+    # Remove warm-up period
     warmup = lookback + skip
     signal.iloc[:warmup] = 0
     daily_returns = daily_returns.iloc[warmup:]
@@ -90,10 +91,7 @@ if price_data.shape[1] > 0:
     # 1. BASIC EQUAL-WEIGHTED TSMOM
     # ========================================
     
-    # Apply signals to returns (signal from yesterday applied to today's return)
     strategy_returns = signal.shift(1) * daily_returns
-    
-    # Equal-weight portfolio
     portfolio_returns = strategy_returns.mean(axis=1)
     cum_basic = (1 + portfolio_returns).cumprod()
     
@@ -101,37 +99,23 @@ if price_data.shape[1] > 0:
     # 2. WITH TRANSACTION COSTS
     # ========================================
     
-    # Calculate turnover (signal changes)
     position_changes = signal.diff().abs()
-    
-    # Transaction cost: 0.02% per trade (one-way)
     cost_per_trade = 0.0002
     costs_per_asset = position_changes * cost_per_trade
-    
-    # Net returns after costs (divided equally across assets)
     net_returns = strategy_returns - costs_per_asset
     net_portfolio = net_returns.mean(axis=1)
     cum_net = (1 + net_portfolio).cumprod()
-    
-    # Calculate annual turnover
     annual_turnover = position_changes.sum(axis=1).sum() / len(position_changes) * 252
     
     # ========================================
     # 3. VOLATILITY TARGETING (10% target)
     # ========================================
     
-    vol_target = 0.10  # 10% annualized target
-    vol_window = 60    # 3-month rolling window
-    
-    # Calculate realized portfolio volatility
+    vol_target = 0.10
+    vol_window = 60
     portfolio_vol = portfolio_returns.rolling(vol_window).std() * np.sqrt(252)
-    
-    # Scale positions to hit target volatility
     vol_scalar = vol_target / portfolio_vol.replace(0, np.nan)
-    vol_scalar = vol_scalar.clip(0, 3)  # Cap at 3x leverage
-    vol_scalar = vol_scalar.fillna(1)
-    
-    # Apply volatility scaling
+    vol_scalar = vol_scalar.clip(0, 3).fillna(1)
     vol_target_returns = portfolio_returns * vol_scalar.shift(1)
     cum_vol = (1 + vol_target_returns).cumprod()
     
@@ -139,15 +123,10 @@ if price_data.shape[1] > 0:
     # 4. RISK PARITY WEIGHTING
     # ========================================
     
-    # Calculate rolling volatility for each asset
     asset_vol = daily_returns.rolling(vol_window).std() * np.sqrt(252)
-    asset_vol = asset_vol.replace(0, np.nan).fillna(method='ffill').fillna(0.01)
-    
-    # Risk parity weights: inversely proportional to volatility
+    asset_vol = asset_vol.replace(0, np.nan).ffill().fillna(0.01)
     inverse_vol = 1 / asset_vol
     risk_weights = inverse_vol.div(inverse_vol.sum(axis=1), axis=0)
-    
-    # Apply risk parity weights to strategy returns
     rp_returns = (risk_weights.shift(1) * signal.shift(1) * daily_returns).sum(axis=1)
     cum_rp = (1 + rp_returns).cumprod()
     
@@ -156,22 +135,15 @@ if price_data.shape[1] > 0:
     # ========================================
     
     def calc_metrics(returns):
-        """Calculate annualized return, Sharpe ratio, and max drawdown"""
         returns = returns.dropna()
         if len(returns) == 0:
             return 0.0, 0.0, 0.0
         
         cum = (1 + returns).cumprod()
-        
-        # Annualized return
         total_years = len(returns) / 252
         ann_ret = (cum.iloc[-1] ** (1 / total_years)) - 1 if total_years > 0 else 0
-        
-        # Sharpe ratio (assuming 0% risk-free rate)
         vol = returns.std() * np.sqrt(252)
         sharpe = ann_ret / vol if vol > 0 else 0.0
-        
-        # Maximum drawdown
         running_max = cum.cummax()
         drawdown = (cum - running_max) / running_max
         max_dd = drawdown.min()
@@ -198,13 +170,26 @@ if price_data.shape[1] > 0:
     print(f"{'Risk Parity':<20} {rp_ret:>7.1%} {rp_sharpe:>8.2f} {rp_dd:>8.1%} {'-':>10}")
     print("="*70)
     
-    # Additional statistics
     print("\nAdditional Statistics:")
     print(f"  Backtest period: {signal.index[0].strftime('%Y-%m-%d')} to {signal.index[-1].strftime('%Y-%m-%d')}")
     print(f"  Trading days: {len(signal)}")
     print(f"  Average positions per day: {signal.abs().sum(axis=1).mean():.1f} / {len(futures_to_etf)}")
     print(f"  Win rate (Basic): {(portfolio_returns > 0).sum() / len(portfolio_returns):.1%}")
     print(f"  Annual turnover: {annual_turnover:.1f}x")
+    
+    # Asset-level performance
+    print("\nAsset-Level Performance (Basic Strategy):")
+    print(f"{'Asset':<8} {'Ann Ret':>9} {'Sharpe':>8} {'Win Rate':>10} {'Avg Long':>10} {'Avg Short':>10}")
+    print("-"*70)
+    
+    for col in strategy_returns.columns:
+        asset_ret = strategy_returns[col]
+        asset_ann_ret, asset_sharpe, _ = calc_metrics(asset_ret)
+        win_rate = (asset_ret > 0).sum() / len(asset_ret)
+        long_pct = (signal[col] == 1).sum() / len(signal[col])
+        short_pct = (signal[col] == -1).sum() / len(signal[col])
+        
+        print(f"{col:<8} {asset_ann_ret:>8.1%} {asset_sharpe:>8.2f} {win_rate:>9.1%} {long_pct:>9.1%} {short_pct:>9.1%}")
     
     # ========================================
     # PLOTTING
@@ -258,8 +243,8 @@ if price_data.shape[1] > 0:
         
         # 4. Annual returns
         ax4 = axes[1, 1]
-        annual_basic = portfolio_returns.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
-        annual_net = net_portfolio.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
+        annual_basic = portfolio_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1) * 100
+        annual_net = net_portfolio.resample('YE').apply(lambda x: (1 + x).prod() - 1) * 100
         
         years = [d.year for d in annual_basic.index]
         x = np.arange(len(years))
@@ -282,4 +267,8 @@ if price_data.shape[1] > 0:
         
     except Exception as e:
         print(f"\nPlotting error: {e}")
-        print("Install matplotlib: pip install matplotlib")
+        print("Install matplotlib if needed: pip install matplotlib")
+
+print("\n" + "="*70)
+print("ANALYSIS COMPLETE")
+print("="*70)
