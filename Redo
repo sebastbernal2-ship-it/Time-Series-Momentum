@@ -70,6 +70,53 @@ if price_data.shape[1] > 0:
     # Calculate daily returns
     daily_returns = price_data.pct_change()
 
+
+    # ========================================
+    # BASELINE TSMOM (12M LOOKBACK, 1M SKIP, EW)
+    # ========================================
+    lookback_base = 252
+    skip_base = 21
+
+    # 12m momentum with 1m skip
+    momentum_base = (price_data.shift(skip_base) /
+                     price_data.shift(lookback_base + skip_base)) - 1
+
+    signal_base = pd.DataFrame(
+        np.where(momentum_base > 0, 1,
+                 np.where(momentum_base < 0, -1, 0)),
+        index=momentum_base.index,
+        columns=momentum_base.columns
+    )
+
+    warmup_base = lookback_base + skip_base
+    signal_base.iloc[:warmup_base] = 0
+    daily_returns_base = daily_returns.iloc[warmup_base:]
+    signal_base = signal_base.iloc[warmup_base:]
+
+    # Equal-weight across active signals each day
+    ew_weights = signal_base.copy().astype(float)
+    active = ew_weights.abs().sum(axis=1)
+    ew_weights = ew_weights.div(active.replace(0, np.nan), axis=0).fillna(0)
+
+    # Baseline strategy returns (pre-cost)
+    base_strategy_returns = (ew_weights.shift(1) * daily_returns_base).sum(axis=1)
+
+    # Transaction costs
+    base_pos_changes = ew_weights.diff().abs().sum(axis=1)
+    base_cost_per_turnover = 0.0002
+    base_trading_costs = base_pos_changes * base_cost_per_turnover
+    base_net_returns = base_strategy_returns - base_trading_costs
+    base_annual_turnover = base_pos_changes.mean() * 252
+
+    # Optional 10% vol target on baseline
+    base_vol_window = 60
+    base_vol_target = 0.10
+    base_port_vol = base_strategy_returns.rolling(base_vol_window).std() * np.sqrt(252)
+    base_vol_scalar = (base_vol_target / base_port_vol.replace(0, np.nan)).clip(0, 3).fillna(1)
+    base_vol_target_returns = base_strategy_returns * base_vol_scalar.shift(1)
+
+
+
     # ========================================
     # MULTI-HORIZON MOMENTUM (3/6/12M, 1M skip)
     # ========================================
@@ -175,6 +222,27 @@ if price_data.shape[1] > 0:
     net_ret, net_sharpe, net_dd = calc_metrics(net_portfolio)
     vol_ret, vol_sharpe, vol_dd = calc_metrics(vol_target_returns)
     lev_ret, lev_sharpe, lev_dd = calc_metrics(leveraged_returns)
+
+    # Baseline metrics
+    base_ret, base_sharpe, base_dd = calc_metrics(base_strategy_returns)
+    base_net_ret, base_net_sharpe, base_net_dd = calc_metrics(base_net_returns)
+    base_vol_ret, base_vol_sharpe, base_vol_dd = calc_metrics(base_vol_target_returns)
+
+    # ========================================
+    # BASELINE vs ENHANCED TABLE
+    # ========================================
+    print("\n" + "="*70)
+    print("TSMOM RESULTS: BASELINE vs ENHANCED")
+    print("="*70)
+    print(f"{'Strategy':<28} {'Ann Ret':>8} {'Sharpe':>8} {'Max DD':>8} {'Turnover':>10}")
+    print("-"*70)
+    print(f"{'Baseline (EW 12m)':<28} {base_ret:>7.1%} {base_sharpe:>8.2f} {base_dd:>8.1%} {base_annual_turnover:>9.1f}x")
+    print(f"{'Baseline + Costs':<28} {base_net_ret:>7.1%} {base_net_sharpe:>8.2f} {base_net_dd:>8.1%} {base_annual_turnover:>9.1f}x")
+    print(f"{'Baseline + VolTarget (10%)':<28} {base_vol_ret:>7.1%} {base_vol_sharpe:>8.2f} {base_vol_dd:>8.1%} {'-':>10}")
+    print(f"{'Enhanced (3/6/12m RP)':<28} {basic_ret:>7.1%} {basic_sharpe:>8.2f} {basic_dd:>8.1%} {annual_turnover:>9.1f}x")
+    print(f"{'Enhanced + Costs':<28} {net_ret:>7.1%} {net_sharpe:>8.2f} {net_dd:>8.1%} {annual_turnover:>9.1f}x")
+    print(f"{'Enhanced + VolTarget (10%)':<28} {vol_ret:>7.1%} {vol_sharpe:>8.2f} {vol_dd:>8.1%} {'-':>10}")
+
 
     # ========================================
     # CORE DIAGNOSTICS
