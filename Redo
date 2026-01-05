@@ -4,366 +4,357 @@ import numpy as np
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
-
-# Optional: plotting
 import matplotlib.pyplot as plt
 
-# Asset universe: futures mapped to ETFs
+# ========================================
+# PRODUCTION TSMOM WITH VALIDATION
+# ========================================
+# This version includes:
+# 1. Walk-forward validation (train/test split)
+# 2. Cross-asset correlation independence check
+# 3. Out-of-sample performance comparison
+# 4. Stress period analysis
+
 futures_to_etf = {
-    'ES': 'SPY', 'NQ': 'QQQ', 'RTY': 'IWM', 'CL': 'USO',
-    'GC': 'GLD', 'HG': 'CPER', 'NG': 'UNG', 'EUR': 'FXE',
-    'GBP': 'FXB', 'JPY': 'FXY', 'ZN': 'IEF', 'ZB': 'TLT'
+    'ES': 'SPY',    # Large-cap US
+    'NQ': 'QQQ',    # Tech/Growth
+    'RTY': 'IWM',   # Small-cap US
+    'CL': 'USO',    # Oil
+    'GC': 'GLD',    # Gold
+    'ZB': 'TLT',    # Long bonds
+    'EUR': 'FXE',   # Euro
+    'JPY': 'FXY',   # Yen
 }
 
 start = '2015-12-31'
 end = '2025-12-28'
 
-print("Libraries imported.")
-print("Asset universe defined: 12 assets")
-print("\nAssets:")
-for future, etf in futures_to_etf.items():
-    print(f"  {future:4s} to {etf}")
-
-print(f"\nDownloading data from {start} to {end}")
+print("="*70)
+print("PRODUCTION TSMOM WITH WALK-FORWARD VALIDATION")
+print("="*70)
 
 # Download data
 data = {}
 for future, etf in futures_to_etf.items():
     print(f"Downloading {future} ({etf})...", end=" ")
     try:
-        df = yf.download(etf, start=start, end=end,
-                         progress=False, auto_adjust=True)
-
+        df = yf.download(etf, start=start, end=end, progress=False, auto_adjust=True)
         if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 close_col = df['Close'].iloc[:, 0] if 'Close' in df.columns.get_level_values(0) else df.iloc[:, -2]
             else:
                 close_col = df['Close']
-
             prices = close_col.dropna()
             if len(prices) > 0:
                 data[future] = prices
-                print(f"{len(prices)} days")
+                print(f"{len(prices)} days ✓")
                 continue
-
-        print("failed")
-        data[future] = pd.Series(dtype=float)
+        print("failed ✗")
     except Exception as e:
-        print(f"error: {e}")
-        data[future] = pd.Series(dtype=float)
+        print(f"error: {e} ✗")
 
-print("\nDownload complete!")
-
-# Create DataFrame
 price_data = pd.DataFrame(data).ffill().dropna(how='all')
-
 print(f"\nPrice data shape: {price_data.shape}")
-if price_data.shape[1] > 0:
-    print("\nFirst few rows:")
-    print(price_data.head())
 
-# ========================================
-# ENHANCED TSMOM BACKTEST
-# ========================================
 if price_data.shape[1] > 0:
-
-    # Calculate daily returns
     daily_returns = price_data.pct_change()
 
-
     # ========================================
-    # BASELINE TSMOM (12M LOOKBACK, 1M SKIP, EW)
-    # ========================================
-    lookback_base = 252
-    skip_base = 21
-
-    # 12m momentum with 1m skip
-    momentum_base = (price_data.shift(skip_base) /
-                     price_data.shift(lookback_base + skip_base)) - 1
-
-    signal_base = pd.DataFrame(
-        np.where(momentum_base > 0, 1,
-                 np.where(momentum_base < 0, -1, 0)),
-        index=momentum_base.index,
-        columns=momentum_base.columns
-    )
-
-    warmup_base = lookback_base + skip_base
-    signal_base.iloc[:warmup_base] = 0
-    daily_returns_base = daily_returns.iloc[warmup_base:]
-    signal_base = signal_base.iloc[warmup_base:]
-
-    # Equal-weight across active signals each day
-    ew_weights = signal_base.copy().astype(float)
-    active = ew_weights.abs().sum(axis=1)
-    ew_weights = ew_weights.div(active.replace(0, np.nan), axis=0).fillna(0)
-
-    # Baseline strategy returns (pre-cost)
-    base_strategy_returns = (ew_weights.shift(1) * daily_returns_base).sum(axis=1)
-
-    # Transaction costs
-    base_pos_changes = ew_weights.diff().abs().sum(axis=1)
-    base_cost_per_turnover = 0.0002
-    base_trading_costs = base_pos_changes * base_cost_per_turnover
-    base_net_returns = base_strategy_returns - base_trading_costs
-    base_annual_turnover = base_pos_changes.mean() * 252
-
-    # Optional 10% vol target on baseline
-    base_vol_window = 60
-    base_vol_target = 0.10
-    base_port_vol = base_strategy_returns.rolling(base_vol_window).std() * np.sqrt(252)
-    base_vol_scalar = (base_vol_target / base_port_vol.replace(0, np.nan)).clip(0, 3).fillna(1)
-    base_vol_target_returns = base_strategy_returns * base_vol_scalar.shift(1)
-
-
-
-    # ========================================
-    # MULTI-HORIZON MOMENTUM (3/6/12M, 1M skip)
-    # ========================================
-    skip = 21
-    m3  = (price_data.shift(skip) / price_data.shift(63 + skip))  - 1
-    m6  = (price_data.shift(skip) / price_data.shift(126 + skip)) - 1
-    m12 = (price_data.shift(skip) / price_data.shift(252 + skip)) - 1
-
-    def zscore(df):
-        return (df - df.mean()) / df.std()
-
-    z3, z6, z12 = zscore(m3), zscore(m6), zscore(m12)
-    combined_momentum = (z3 + z6 + z12) / 3
-
-    # Thresholded signal + weekly rebalancing
-    lookback = 252
-    warmup = lookback + skip
-    threshold = 0.01                                                                                        ######################### Signal threshold
-
-    raw_signal = pd.DataFrame(
-        np.where(combined_momentum > threshold, 1,
-                 np.where(combined_momentum < -threshold, -1, 0)),
-        index=combined_momentum.index,
-        columns=combined_momentum.columns
-    )
-
-    # Trade once per week (every 5th business day)
-    rebalance_mask = (np.arange(len(raw_signal)) % 10 == 0)                                                 ######################### Rebalance frequency
-    rebalance_mask_series = pd.Series(rebalance_mask, index=raw_signal.index)
-    raw_signal = raw_signal.where(rebalance_mask_series, np.nan).ffill()
-
-    # Remove warm-up
-    signal = raw_signal.copy()
-    signal.iloc[:warmup] = 0
-    daily_returns = daily_returns.iloc[warmup:]
-    signal = signal.iloc[warmup:]
-    price_data_trim = price_data.iloc[warmup:]
-
-    # Align combined_momentum
-    cm_trim = combined_momentum.loc[signal.index]
-
-    # ========================================
-    # STRENGTH-BASED RISK-PARITY WEIGHTING
-    # ========================================
-    raw_weights = cm_trim.clip(-2, 2)
-
-    vol_window = 60
-    asset_vol = daily_returns.rolling(vol_window).std() * np.sqrt(252)
-    asset_vol = asset_vol.replace(0, np.nan).ffill().fillna(0.01)
-    inv_vol = 1 / asset_vol
-
-    rp_weights = raw_weights * inv_vol
-    rp_weights = rp_weights.div(rp_weights.abs().sum(axis=1), axis=0).fillna(0)
-
-    # Final positions: align direction with signal
-    positions = np.sign(signal) * rp_weights
-
-    # Strategy returns (pre-cost, unlevered)
-    strategy_returns = (positions.shift(1) * daily_returns).sum(axis=1)
-
-    # ========================================
-    # TRANSACTION COSTS
-    # ========================================
-    position_changes = positions.diff().abs().sum(axis=1)
-    cost_per_turnover = 0.0002
-    trading_costs = position_changes * cost_per_turnover
-    net_portfolio = strategy_returns - trading_costs
-
-    annual_turnover = position_changes.mean() * 252
-
-    # ========================================
-    # VOLATILITY TARGETING (10% TARGET)
-    # ========================================
-    vol_target = 0.10
-    port_vol = strategy_returns.rolling(vol_window).std() * np.sqrt(252)
-    vol_scalar = (vol_target / port_vol.replace(0, np.nan)).clip(0, 3).fillna(1)
-    vol_target_returns = strategy_returns * vol_scalar.shift(1)
-
-    # ========================================
-    # OPTIONAL LEVERAGE (e.g. 2x) ON NET RETURNS
-    # ========================================
-    leverage = 2.0
-    leveraged_returns = net_portfolio * leverage
-
-    # ========================================
-    # PERFORMANCE METRICS
-    # ========================================
-    def calc_metrics(returns):
-        returns = returns.dropna()
-        if len(returns) == 0:
-            return 0.0, 0.0, 0.0
-        cum = (1 + returns).cumprod()
-        years = len(returns) / 252
-        ann = cum.iloc[-1]**(1 / years) - 1 if years > 0 else 0
-        vol = returns.std() * np.sqrt(252)
-        sharpe = ann / vol if vol > 0 else 0.0
-        running_max = cum.cummax()
-        dd = (cum - running_max) / running_max
-        max_dd = dd.min()
-        return ann, sharpe, max_dd
-
-    basic_ret, basic_sharpe, basic_dd = calc_metrics(strategy_returns)
-    net_ret, net_sharpe, net_dd = calc_metrics(net_portfolio)
-    vol_ret, vol_sharpe, vol_dd = calc_metrics(vol_target_returns)
-    lev_ret, lev_sharpe, lev_dd = calc_metrics(leveraged_returns)
-
-    # Baseline metrics
-    base_ret, base_sharpe, base_dd = calc_metrics(base_strategy_returns)
-    base_net_ret, base_net_sharpe, base_net_dd = calc_metrics(base_net_returns)
-    base_vol_ret, base_vol_sharpe, base_vol_dd = calc_metrics(base_vol_target_returns)
-
-    # ========================================
-    # BASELINE vs ENHANCED TABLE
+    # 1. CORRELATION CHECK FOR INDEPENDENCE
     # ========================================
     print("\n" + "="*70)
-    print("TSMOM RESULTS: BASELINE vs ENHANCED")
+    print("CROSS-ASSET CORRELATION (Full Period)")
     print("="*70)
-    print(f"{'Strategy':<28} {'Ann Ret':>8} {'Sharpe':>8} {'Max DD':>8} {'Turnover':>10}")
-    print("-"*70)
-    print(f"{'Baseline (EW 12m)':<28} {base_ret:>7.1%} {base_sharpe:>8.2f} {base_dd:>8.1%} {base_annual_turnover:>9.1f}x")
-    print(f"{'Baseline + Costs':<28} {base_net_ret:>7.1%} {base_net_sharpe:>8.2f} {base_net_dd:>8.1%} {base_annual_turnover:>9.1f}x")
-    print(f"{'Baseline + VolTarget (10%)':<28} {base_vol_ret:>7.1%} {base_vol_sharpe:>8.2f} {base_vol_dd:>8.1%} {'-':>10}")
-    print(f"{'Enhanced (3/6/12m RP)':<28} {basic_ret:>7.1%} {basic_sharpe:>8.2f} {basic_dd:>8.1%} {annual_turnover:>9.1f}x")
-    print(f"{'Enhanced + Costs':<28} {net_ret:>7.1%} {net_sharpe:>8.2f} {net_dd:>8.1%} {annual_turnover:>9.1f}x")
-    print(f"{'Enhanced + VolTarget (10%)':<28} {vol_ret:>7.1%} {vol_sharpe:>8.2f} {vol_dd:>8.1%} {'-':>10}")
-
+    corr_full = daily_returns.corr()
+    print(corr_full.round(2))
+    
+    # Check for redundancy
+    print("\n" + "="*70)
+    print("REDUNDANCY CHECK (>0.7 correlation)")
+    print("="*70)
+    high_corr = []
+    for i in range(len(corr_full.columns)):
+        for j in range(i+1, len(corr_full.columns)):
+            if abs(corr_full.iloc[i, j]) > 0.7:
+                high_corr.append((corr_full.columns[i], corr_full.columns[j], corr_full.iloc[i, j]))
+    
+    if high_corr:
+        print("⚠️  HIGH CORRELATION PAIRS (>0.7):")
+        for a, b, c in high_corr:
+            print(f"  {a} ↔ {b}: {c:.3f}")
+    else:
+        print("✓ PASS: No redundant pairs. All assets independent (<0.7)")
+    
+    # Check negative correlations (crisis hedges)
+    print("\n" + "="*70)
+    print("HEDGE QUALITY CHECK (negative correlations)")
+    print("="*70)
+    es_corr = corr_full.loc['ES']
+    print("ES (Large-cap US) correlations:")
+    for asset in es_corr.index:
+        if asset != 'ES':
+            corr_val = es_corr[asset]
+            quality = "✓ Good hedge" if corr_val < 0 else "↔ Neutral" if abs(corr_val) < 0.3 else "✗ High corr"
+            print(f"  ES ↔ {asset}: {corr_val:>7.3f} {quality}")
 
     # ========================================
-    # CORE DIAGNOSTICS
+    # 2. WALK-FORWARD VALIDATION
     # ========================================
     print("\n" + "="*70)
-    print("ENHANCED TSMOM RESULTS (3/6/12M, RP, WEEKLY, STRENGTH SIZING)")
+    print("WALK-FORWARD VALIDATION SETUP")
     print("="*70)
-    print(f"{'Strategy':<20} {'Ann Ret':>8} {'Sharpe':>8} {'Max DD':>8} {'Turnover':>10}")
+    
+    # Split: Train 2015-2020, Test 2020-2025
+    train_end = '2020-12-31'
+    test_start = '2021-01-01'
+    
+    train_data = price_data[price_data.index <= train_end]
+    test_data = price_data[price_data.index >= test_start]
+    
+    train_returns = train_data.pct_change()
+    test_returns = test_data.pct_change()
+    
+    print(f"Training period: {train_data.index[0].date()} to {train_data.index[-1].date()} ({len(train_data)} days)")
+    print(f"Testing period:  {test_data.index[0].date()} to {test_data.index[-1].date()} ({len(test_data)} days)")
+    
+    def run_tsmom(price_df, returns_df, name="Strategy"):
+        """Run TSMOM on given data"""
+        
+        # Multi-horizon momentum
+        skip = 21
+        m3  = (price_df.shift(skip) / price_df.shift(63 + skip)) - 1
+        m6  = (price_df.shift(skip) / price_df.shift(126 + skip)) - 1
+        m12 = (price_df.shift(skip) / price_df.shift(252 + skip)) - 1
+        
+        def zscore(df):
+            return (df - df.mean()) / df.std()
+        
+        z3, z6, z12 = zscore(m3), zscore(m6), zscore(m12)
+        combined_momentum = (z3 + z6 + z12) / 3
+        
+        # Signal
+        threshold = 0.01
+        raw_signal = pd.DataFrame(
+            np.where(combined_momentum > threshold, 1,
+                     np.where(combined_momentum < -threshold, -1, 0)),
+            index=combined_momentum.index,
+            columns=combined_momentum.columns
+        )
+        
+        # Weekly rebalance
+        rebalance_mask = (np.arange(len(raw_signal)) % 10 == 0)
+        rebalance_mask_series = pd.Series(rebalance_mask, index=raw_signal.index)
+        raw_signal = raw_signal.where(rebalance_mask_series, np.nan).ffill()
+        
+        # Warmup
+        warmup = 252 + skip
+        signal = raw_signal.iloc[warmup:].copy()
+        ret_trim = returns_df.iloc[warmup:].copy()
+        cm_trim = combined_momentum.loc[signal.index]
+        
+        # Risk-parity weighting
+        raw_weights = cm_trim.clip(-2, 2)
+        vol_window = 60
+        asset_vol = ret_trim.rolling(vol_window).std() * np.sqrt(252)
+        asset_vol = asset_vol.replace(0, np.nan).ffill().fillna(0.01)
+        inv_vol = 1 / asset_vol
+        
+        rp_weights = raw_weights * inv_vol
+        rp_weights = rp_weights.div(rp_weights.abs().sum(axis=1), axis=0).fillna(0)
+        
+        # Positions
+        positions = np.sign(signal) * rp_weights
+        
+        # Returns
+        strategy_ret = (positions.shift(1) * ret_trim).sum(axis=1).fillna(0)
+        
+        # Costs
+        pos_changes = positions.diff().abs().sum(axis=1).fillna(0)
+        trading_costs = pos_changes * 0.0002
+        net_ret = strategy_ret - trading_costs
+        
+        # Vol targeting
+        vol_target = 0.10
+        port_vol = strategy_ret.rolling(vol_window).std() * np.sqrt(252)
+        vol_scalar = (vol_target / port_vol.replace(0, np.nan)).clip(0, 3).fillna(1)
+        vol_target_ret = (strategy_ret * vol_scalar.shift(1)).fillna(0)
+        
+        # Metrics
+        def calc_metrics(r):
+            r = r.dropna()
+            if len(r) == 0:
+                return 0.0, 0.0, 0.0
+            cum = (1 + r).cumprod()
+            years = len(r) / 252
+            ann = cum.iloc[-1]**(1/years) - 1 if years > 0 else 0
+            vol = r.std() * np.sqrt(252)
+            sharpe = ann / vol if vol > 0 else 0.0
+            dd = ((cum - cum.cummax()) / cum.cummax()).min()
+            return ann, sharpe, dd
+        
+        ann, sharpe, dd = calc_metrics(net_ret)
+        vol_ann, vol_sharpe, vol_dd = calc_metrics(vol_target_ret)
+        
+        return {
+            'name': name,
+            'net_ret': ann,
+            'net_sharpe': sharpe,
+            'net_dd': dd,
+            'vol_ret': vol_ann,
+            'vol_sharpe': vol_sharpe,
+            'vol_dd': vol_dd,
+            'turnover': pos_changes.mean() * 252,
+            'prices': price_df,
+            'returns': ret_trim,
+            'positions': positions,
+            'strategy_ret': strategy_ret,
+            'net_portfolio': net_ret,
+            'vol_target_ret': vol_target_ret
+        }
+    
+    # Run on both periods
+    train_results = run_tsmom(train_data, train_returns, "Training (2015-2020)")
+    test_results = run_tsmom(test_data, test_returns, "Testing (2021-2025)")
+    
+    # ========================================
+    # 3. RESULTS COMPARISON
+    # ========================================
+    print("\n" + "="*70)
+    print("WALK-FORWARD VALIDATION RESULTS")
+    print("="*70)
+    print(f"{'Period':<20} {'Ann Ret':>9} {'Sharpe':>9} {'Max DD':>9} {'Turnover':>10}")
     print("-"*70)
-    print(f"{'Strength RP':<20} {basic_ret:>7.1%} {basic_sharpe:>8.2f} {basic_dd:>8.1%} {annual_turnover:>9.1f}x")
-    print(f"{'+ Costs':<20} {net_ret:>7.1%} {net_sharpe:>8.2f} {net_dd:>8.1%} {annual_turnover:>9.1f}x")
-    print(f"{'+ Vol Target (10%)':<20} {vol_ret:>7.1%} {vol_sharpe:>8.2f} {vol_dd:>8.1%} {'-':>10}")
-    print(f"{'+ 2x Leverage':<20} {lev_ret:>7.1%} {lev_sharpe:>8.2f} {lev_dd:>8.1%} {'-':>10}")
+    print(f"{'Training (2015-20)':<20} {train_results['net_ret']:>8.1%} {train_results['net_sharpe']:>9.2f} {train_results['net_dd']:>8.1%} {train_results['turnover']:>9.1f}x")
+    print(f"{'Testing (2021-25)':<20} {test_results['net_ret']:>8.1%} {test_results['net_sharpe']:>9.2f} {test_results['net_dd']:>8.1%} {test_results['turnover']:>9.1f}x")
+    print("-"*70)
+    
+    # Degradation analysis
+    ret_degrade = (test_results['net_ret'] - train_results['net_ret'])
+    sharpe_degrade = (test_results['net_sharpe'] - train_results['net_sharpe'])
+    dd_degrade = (test_results['net_dd'] - train_results['net_dd'])
+    
+    print(f"\n{'Degradation:':<20} {ret_degrade:>8.1%} {sharpe_degrade:>9.2f} {dd_degrade:>8.1%}")
+    
+    if abs(sharpe_degrade) < 0.5:
+        print("✓ ROBUST: Sharpe degradation <0.5 (good out-of-sample stability)")
+    elif abs(sharpe_degrade) < 1.0:
+        print("⚠️  MODERATE: Sharpe degradation 0.5-1.0 (some overfitting)")
+    else:
+        print("✗ OVERFIT: Sharpe degradation >1.0 (significant overfitting)")
+    
+    # Vol-target comparison
+    print("\n" + "="*70)
+    print("WITH 10% VOL TARGET")
     print("="*70)
-
-    print("\nAdditional Statistics:")
-    print(f"  Backtest period: {signal.index[0].strftime('%Y-%m-%d')} to {signal.index[-1].strftime('%Y-%m-%d')}")
-    print(f"  Trading days: {len(signal)}")
-    print(f"  Average |positions| per day: {positions.abs().sum(axis=1).mean():.2f}")
-    print(f"  Annual turnover (notional): {annual_turnover:.1f}x")
-
+    print(f"{'Period':<20} {'Ann Ret':>9} {'Sharpe':>9} {'Max DD':>9}")
+    print("-"*70)
+    print(f"{'Training (2015-20)':<20} {train_results['vol_ret']:>8.1%} {train_results['vol_sharpe']:>9.2f} {train_results['vol_dd']:>8.1%}")
+    print(f"{'Testing (2021-25)':<20} {test_results['vol_ret']:>8.1%} {test_results['vol_sharpe']:>9.2f} {test_results['vol_dd']:>8.1%}")
+    
     # ========================================
-    # ASSET-LEVEL PERFORMANCE
+    # 4. STRESS PERIOD ANALYSIS
     # ========================================
-    print("\nAsset-Level Performance (Strength RP):")
-    print(f"{'Asset':<8} {'Ann Ret':>9} {'Sharpe':>8} {'Win Rate':>10}")
-    print("-"*50)
-
-    asset_returns = positions.shift(1) * daily_returns
-    for col in asset_returns.columns:
-        r = asset_returns[col].dropna()
-        if len(r) == 0:
-            continue
-        ann, sh, _ = calc_metrics(r)
-        win = (r > 0).mean()
-        print(f"{col:<8} {ann:>8.1%} {sh:>8.2f} {win:>9.1%}")
-
+    print("\n" + "="*70)
+    print("STRESS PERIOD PERFORMANCE (Test Period)")
+    print("="*70)
+    
+    stress_periods = [
+        ('2021-01-01', '2021-12-31', '2021: Fed Taper Tantrum'),
+        ('2022-01-01', '2022-12-31', '2022: Rate Shock'),
+        ('2023-03-01', '2023-03-31', '2023: Bank Crisis'),
+        ('2024-01-01', '2024-12-31', '2024: Year'),
+    ]
+    
+    test_net = test_results['net_portfolio']
+    def calc_period_metrics(ret_series, start_p, end_p):
+        try:
+            period_ret = ret_series[start_p:end_p]
+            if len(period_ret) < 5:
+                return None
+            cum = (1 + period_ret).prod() - 1
+            vol = period_ret.std() * np.sqrt(252)
+            sharpe = (cum / (len(period_ret)/252)) / vol if vol > 0 else 0
+            dd = ((period_ret.cumsum() - period_ret.cumsum().cummax()) / period_ret.cumsum().cummax()).min()
+            return cum, sharpe, dd
+        except:
+            return None
+    
+    for start_p, end_p, label in stress_periods:
+        metrics = calc_period_metrics(test_net, start_p, end_p)
+        if metrics:
+            ret, sharpe, dd = metrics
+            print(f"{label:<25}: Return {ret:>8.1%}, Sharpe {sharpe:>6.2f}, Max DD {dd:>7.1%}")
+    
     # ========================================
-    # PLOTTING
+    # 5. PLOTTING
     # ========================================
     try:
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-        # 1. Cumulative returns
-        cum_basic = (1 + strategy_returns).cumprod()
-        cum_net = (1 + net_portfolio).cumprod()
-        cum_vol = (1 + vol_target_returns).cumprod()
-        cum_lev = (1 + leveraged_returns).cumprod()
-
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+        
+        # Train vs Test cumulative
         ax1 = axes[0, 0]
-        ax1.plot(cum_basic.index, cum_basic, label='Strength RP', linewidth=2)
-        ax1.plot(cum_net.index, cum_net, label='+ Costs', linewidth=2)
-        ax1.plot(cum_vol.index, cum_vol, label='+ Vol Target', linewidth=2)
-        ax1.plot(cum_lev.index, cum_lev, label='+ 2x Leverage', linewidth=2)
-        ax1.set_title('Cumulative Returns', fontsize=12, fontweight='bold')
+        train_cum = (1 + train_results['net_portfolio']).cumprod()
+        test_cum = (1 + test_results['net_portfolio']).cumprod()
+        ax1.plot(train_cum.index, train_cum, label='Training (2015-20)', linewidth=2, color='blue')
+        ax1.plot(test_cum.index, test_cum, label='Testing (2021-25)', linewidth=2, color='orange')
+        ax1.axvline(x=pd.Timestamp('2021-01-01'), color='red', linestyle='--', alpha=0.5, label='Train/Test Split')
+        ax1.set_title('Walk-Forward: Training vs Test Performance', fontsize=12, fontweight='bold')
         ax1.set_ylabel('Cumulative Return')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-
-        # 2. Drawdowns
+        
+        # Correlation heatmap
         ax2 = axes[0, 1]
-        dd_basic = (cum_basic / cum_basic.cummax() - 1) * 100
-        dd_net = (cum_net / cum_net.cummax() - 1) * 100
-        dd_vol = (cum_vol / cum_vol.cummax() - 1) * 100
-        dd_lev = (cum_lev / cum_lev.cummax() - 1) * 100
-
-        ax2.fill_between(dd_basic.index, dd_basic, 0, alpha=0.3, label='Strength RP')
-        ax2.fill_between(dd_net.index, dd_net, 0, alpha=0.3, label='+ Costs')
-        ax2.fill_between(dd_vol.index, dd_vol, 0, alpha=0.3, label='+ Vol Target')
-        ax2.fill_between(dd_lev.index, dd_lev, 0, alpha=0.3, label='+ 2x Leverage')
-        ax2.set_title('Drawdowns', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Drawdown (%)')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # 3. Rolling Sharpe (1-year) – pre- and post-cost
+        im = ax2.imshow(corr_full, cmap='RdYlGn', vmin=-1, vmax=1, aspect='auto')
+        ax2.set_xticks(range(len(corr_full.columns)))
+        ax2.set_yticks(range(len(corr_full.columns)))
+        ax2.set_xticklabels(corr_full.columns, rotation=45)
+        ax2.set_yticklabels(corr_full.columns)
+        for i in range(len(corr_full)):
+            for j in range(len(corr_full)):
+                ax2.text(j, i, f'{corr_full.iloc[i, j]:.2f}', ha='center', va='center', fontsize=8)
+        ax2.set_title('Cross-Asset Correlation (Independence Check)', fontsize=12, fontweight='bold')
+        plt.colorbar(im, ax=ax2)
+        
+        # Drawdown comparison
         ax3 = axes[1, 0]
-        roll_window = 252
-        roll_sharpe_basic = (strategy_returns.rolling(roll_window).mean() * 252) / (
-            strategy_returns.rolling(roll_window).std() * np.sqrt(252)
-        )
-        roll_sharpe_net = (net_portfolio.rolling(roll_window).mean() * 252) / (
-            net_portfolio.rolling(roll_window).std() * np.sqrt(252)
-        )
-
-        ax3.plot(roll_sharpe_basic.index, roll_sharpe_basic, label='Strength RP', linewidth=2)
-        ax3.plot(roll_sharpe_net.index, roll_sharpe_net, label='+ Costs', linewidth=2)
-        ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-        ax3.set_title('Rolling 1-Year Sharpe Ratio', fontsize=12, fontweight='bold')
-        ax3.set_ylabel('Sharpe Ratio')
+        train_dd = (train_cum / train_cum.cummax() - 1) * 100
+        test_dd = (test_cum / test_cum.cummax() - 1) * 100
+        ax3.fill_between(train_dd.index, train_dd, 0, alpha=0.3, label='Training DD', color='blue')
+        ax3.fill_between(test_dd.index, test_dd, 0, alpha=0.3, label='Testing DD', color='orange')
+        ax3.set_title('Drawdown Comparison', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('Drawdown (%)')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
-
-        # 4. Annual returns (net vs 2x net)
+        
+        # Rolling Sharpe
         ax4 = axes[1, 1]
-        annual_net = net_portfolio.resample('YE').apply(lambda x: (1 + x).prod() - 1) * 100
-        annual_lev = leveraged_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1) * 100
-
-        years = [d.year for d in annual_net.index]
-        x = np.arange(len(years))
-        width = 0.35
-
-        ax4.bar(x - width/2, annual_net, width, label='Net (1x)', alpha=0.8)
-        ax4.bar(x + width/2, annual_lev, width, label='Net (2x)', alpha=0.8)
-        ax4.set_title('Annual Returns', fontsize=12, fontweight='bold')
-        ax4.set_ylabel('Return (%)')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(years, rotation=45)
+        roll_window = 252
+        roll_sharpe_train = (train_results['strategy_ret'].rolling(roll_window).mean() * 252) / (
+            train_results['strategy_ret'].rolling(roll_window).std() * np.sqrt(252)
+        )
+        roll_sharpe_test = (test_results['strategy_ret'].rolling(roll_window).mean() * 252) / (
+            test_results['strategy_ret'].rolling(roll_window).std() * np.sqrt(252)
+        )
+        ax4.plot(roll_sharpe_train.index, roll_sharpe_train, label='Training', linewidth=2, color='blue')
+        ax4.plot(roll_sharpe_test.index, roll_sharpe_test, label='Testing', linewidth=2, color='orange')
         ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax4.axvline(x=pd.Timestamp('2021-01-01'), color='red', linestyle='--', alpha=0.5)
+        ax4.set_title('Rolling 1-Year Sharpe', fontsize=12, fontweight='bold')
+        ax4.set_ylabel('Sharpe Ratio')
         ax4.legend()
         ax4.grid(True, alpha=0.3)
-
+        
         plt.tight_layout()
-        plt.savefig('tsmom_enhanced_results.png', dpi=300, bbox_inches='tight')
-        print("\nChart saved to: tsmom_enhanced_results.png")
+        plt.savefig('tsmom_validation.png', dpi=300, bbox_inches='tight')
+        print("\n" + "="*70)
+        print("✓ Chart saved: tsmom_validation.png")
+        print("="*70)
         plt.show()
-
+    
     except Exception as e:
         print(f"\nPlotting error: {e}")
-        print("Install matplotlib if needed: pip install matplotlib")
 
 print("\n" + "="*70)
-print("ANALYSIS COMPLETE")
+print("VALIDATION COMPLETE")
 print("="*70)
